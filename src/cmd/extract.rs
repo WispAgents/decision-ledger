@@ -22,6 +22,9 @@ pub struct Args {
     no_git: bool,
     #[arg(long)]
     no_sessions: bool,
+    /// Also read a doc that states project rules, e.g. AGENTS.md (repeatable). Read once.
+    #[arg(long)]
+    doc: Vec<String>,
     /// Claude Code projects directory (default ~/.claude/projects).
     #[arg(long)]
     sessions_dir: Option<PathBuf>,
@@ -70,7 +73,10 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
         None => seen.floor,
     };
 
-    let mut texts = Vec::new();
+    let mut texts = source::docs(&repo.git, &args.doc)?;
+    if !texts.is_empty() {
+        println!("docs: {} sections", texts.len());
+    }
     if !args.no_git {
         let found = source::commits(&repo.git, floor, 20_000)?;
         println!("commits: {}", found.len());

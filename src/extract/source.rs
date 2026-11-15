@@ -31,7 +31,7 @@ pub fn worth_reading(t: &Text) -> bool {
         || ["dependabot", "renovate", "github-actions"]
             .iter()
             .any(|b| author.contains(b));
-    !bot && t.text.trim().chars().count() >= 40
+    !bot && t.text.trim().chars().count() >= 40 || (t.kind == "doc" && !t.text.trim().is_empty())
 }
 
 /// Commit messages after `since` (exclusive), newest first, at most `max`.
@@ -83,6 +83,49 @@ pub fn commits(git: &Git, since: i64, max: usize) -> Result<Vec<Text>> {
             })
         })
         .collect())
+}
+
+/// Sections of docs that state the project's rules (AGENTS.md, CONTRIBUTING.md, an ADR folder),
+/// split at headings and blank-line paragraphs into pieces of at most ~2,500 characters.
+pub fn docs(git: &Git, paths: &[String]) -> Result<Vec<Text>> {
+    let mut out = Vec::new();
+    for path in paths {
+        let rel = git.relative(Path::new(path));
+        let text =
+            std::fs::read_to_string(git.root().join(&rel)).with_context(|| format!("reading {rel}"))?;
+        // Last commit touching the file, so the record's date means something.
+        let time = git
+            .try_run(&["log", "-1", "--format=%ct", "--", &rel])
+            .and_then(|t| t.trim().parse().ok())
+            .unwrap_or_else(crate::record::now);
+        let mut piece = String::new();
+        let mut n = 0;
+        let mut flush = |piece: &mut String, out: &mut Vec<Text>| {
+            if !piece.trim().is_empty() {
+                n += 1;
+                out.push(Text {
+                    id: format!("doc:{rel}#{n}"),
+                    kind: "doc".into(),
+                    author: String::new(),
+                    time,
+                    text: piece.trim().to_owned(),
+                    url: rel.clone(),
+                    paths: Vec::new(),
+                });
+            }
+            piece.clear();
+        };
+        for para in text.split("\n\n") {
+            let heading = para.trim_start().starts_with('#');
+            if heading || piece.len() + para.len() > 2500 {
+                flush(&mut piece, &mut out);
+            }
+            piece.push_str(para);
+            piece.push_str("\n\n");
+        }
+        flush(&mut piece, &mut out);
+    }
+    Ok(out)
 }
 
 /// `owner/name` of the repository's GitHub remote, via `gh`.
@@ -322,6 +365,27 @@ mod tests {
         assert!(human_text(&user).is_some());
         assert!(human_text(&tool).is_none());
         assert!(human_text(&side).is_none());
+    }
+
+    #[test]
+    fn docs_split_at_headings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "# Rules\n\nUse apiClient.\n\n## Tests\n\nNo network in unit tests.\n",
+        )
+        .unwrap();
+        let git = Git::open(dir.path()).unwrap();
+        let texts = docs(&git, &["AGENTS.md".into()]).unwrap();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0].id, "doc:AGENTS.md#1");
+        assert!(texts[1].text.contains("No network"));
+        assert!(texts.iter().all(worth_reading), "short doc sections still count");
     }
 
     #[test]

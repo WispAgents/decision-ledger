@@ -20,7 +20,10 @@ The ledger is most useful when a team records decisions as they make them (`deci
 ## Install
 
 ```sh
-cargo install --locked --git https://github.com/WispAgents/decision-ledger decision-ledger
+brew install wispagents/tap/decision-ledger
+# or a prebuilt binary from https://github.com/WispAgents/decision-ledger/releases
+# or from source:
+cargo install --locked --git https://github.com/WispAgents/decision-ledger --tag v0.1.0 decision-ledger
 ```
 
 Needs `git`. Optional: `gh` (logged in) to read GitHub PRs, reviews and issues; Claude Code (`claude`)
@@ -134,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: WispAgents/decision-ledger/action@main
+      - uses: WispAgents/decision-ledger/action@v0.1.0
 ```
 
 ## How extraction works

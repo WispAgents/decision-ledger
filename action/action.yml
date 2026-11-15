@@ -5,14 +5,25 @@ inputs:
     description: Revision to diff against. Defaults to the pull request base.
     default: ${{ github.event.pull_request.base.sha }}
   version:
-    description: Git ref of decision-ledger to install.
-    default: main
+    description: Release of WispAgents/decision-ledger to use.
+    default: v0.1.0
 runs:
   using: composite
   steps:
     - name: Install decisions
       shell: bash
-      run: cargo install --locked --git https://github.com/WispAgents/decision-ledger --rev "${{ inputs.version }}" decision-ledger
+      run: |
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) target=x86_64-unknown-linux-gnu ;;
+          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
+          macOS-X64) target=x86_64-apple-darwin ;;
+          macOS-ARM64) target=aarch64-apple-darwin ;;
+          *) echo "unsupported runner $RUNNER_OS-$RUNNER_ARCH"; exit 1 ;;
+        esac
+        url="https://github.com/WispAgents/decision-ledger/releases/download/${{ inputs.version }}/decisions-${{ inputs.version }}-$target.tar.gz"
+        mkdir -p "$RUNNER_TEMP/decisions"
+        curl -fsSL "$url" | tar -xz -C "$RUNNER_TEMP/decisions"
+        echo "$RUNNER_TEMP/decisions" >> "$GITHUB_PATH"
     - name: Check added lines
       shell: bash
       run: decisions check --diff "${{ inputs.base }}...HEAD" --format github

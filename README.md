@@ -20,7 +20,10 @@ The ledger is most useful when a team records decisions as they make them (`deci
 ## Install
 
 ```sh
-cargo install --locked --git https://github.com/WispAgents/decision-ledger decision-ledger
+brew install wispagents/tap/decision-ledger
+# or a prebuilt binary from https://github.com/WispAgents/decision-ledger/releases
+# or from source:
+cargo install --locked --git https://github.com/WispAgents/decision-ledger --tag v0.1.0 decision-ledger
 ```
 
 Needs `git`. Optional: `gh` (logged in) to read GitHub PRs, reviews and issues; Claude Code (`claude`)
@@ -37,7 +40,7 @@ decisions add "Billing code calls the payments client, never raw fetch." \
   --scope "src/billing/**" \
   --forbid-pattern 'TypeScript:fetch($$$A)'
 
-decisions extract                  # propose decisions from commits, PRs, reviews, issues, your sessions
+decisions extract --doc AGENTS.md  # propose decisions from your rules doc, commits, PRs, reviews, issues, sessions
 decisions review                   # accept / edit / reject, one card per proposal
 git commit decisions/ -m "decisions"
 ```
@@ -116,7 +119,7 @@ Overrides are logged, and `decisions stale` flags decisions that are overridden 
 |---|---|
 | `init` | Create `decisions/`, install hooks |
 | `add <decision> [--scope] [--reason] [--forbid-import] [--forbid-dep] [--forbid-pattern Lang:pattern] [--propose]` | Record a decision; `--propose` writes a proposal instead |
-| `extract [--since DATE] [--github owner/name] [--no-git] [--no-github] [--no-sessions] [--dry-run]` | Propose decisions from commits, GitHub, and what you typed in Claude Code sessions. Resumes where it stopped |
+| `extract [--doc AGENTS.md] [--since DATE] [--github owner/name] [--no-git] [--no-github] [--no-sessions] [--dry-run]` | Propose decisions from commits, GitHub, and what you typed in Claude Code sessions. Resumes where it stopped |
 | `review`, `accept <ids>`, `reject <id> --reason` | Act on proposals; rejected ones aren't proposed again |
 | `supersede <id> --decision --reason` | Propose a replacement |
 | `list [--all]`, `show <id>`, `for <path> [--json]` | Read the ledger |
@@ -134,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
-      - uses: WispAgents/decision-ledger/action@main
+      - uses: WispAgents/decision-ledger/action@v0.1.0
 ```
 
 ## How extraction works

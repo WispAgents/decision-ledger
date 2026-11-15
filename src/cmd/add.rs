@@ -75,7 +75,7 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
     };
     if args.propose {
         record.status = Status::Proposed;
-        record.id = crate::record::proposal_id(&record.decision);
+        record.id = repo.ledger.fresh_pending_id(&record.decision)?;
         let path = repo.ledger.pending_path(&record.id)?;
         record.save(&path)?;
         println!(

@@ -28,7 +28,10 @@ impl Session {
     pub fn save(&self, state: &Path, id: &str) -> Result<()> {
         let path = file(state, id);
         std::fs::create_dir_all(path.parent().expect("has parent"))?;
-        std::fs::write(path, serde_json::to_string(self)?)?;
+        // Write then rename, so concurrent hooks never read half a file.
+        let tmp = path.with_extension(format!("json.{}", std::process::id()));
+        std::fs::write(&tmp, serde_json::to_string(self)?)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 }

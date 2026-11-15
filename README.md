@@ -84,8 +84,18 @@ it. No scope, or `**`, is repo-wide.
 | `PreToolUse` on Edit / Write / MultiEdit | The edit is simulated first. If an added line breaks a decision's checks, the edit is **denied** with the decision and the way out. Otherwise the decisions scoped to that file are added as context, each once per session |
 | `Stop` | Re-checks only the files this session edited. A broken decision sends the turn back (up to 3 times) |
 
-Tested live with Claude Code 2.1: asked to write raw `fetch` in `src/billing/`, the edit was denied,
-the file left unchanged, and the agent explained the decision to the user instead of working around it.
+Agents can't edit accepted records under `decisions/`; they propose with `decisions add --propose`
+or `decisions supersede`. Pre-commit and CI judge a change by the ledger it started from, so a branch
+can't retire a decision and break it in the same diff. CI also flags any ledger change.
+
+Tested live with Claude Code 2.1.322: asked to write raw `fetch` in `src/billing/`, the edit was
+denied, the file left unchanged, and the agent explained the decision to the user instead of working
+around it. Scoped context through `PreToolUse` `additionalContext` needs a recent Claude Code
+(2.1 or later); older versions ignore it, but the deny still works.
+
+**Known limits:** the Stop hook only re-checks files the agent changed through Edit / Write /
+MultiEdit. Changes made through Bash (`sed -i`, code generators) are caught by pre-commit and CI,
+not in the session. Import detection is line-based for JS/TS, Python, Go and Rust.
 
 ## Changing a decision
 
@@ -129,9 +139,11 @@ jobs:
 
 ## How extraction works
 
-`extract` reads texts newer than its cursor (`.git/decisions/cursor.json`; 90 days on the first
-run): commit messages, GitHub PRs, review comments, issues and issue comments (via `gh api`), and
-the messages you typed in Claude Code sessions for this repo. Bots and short texts are skipped. A
+`extract` reads texts it hasn't read before (tracked by id in `.git/decisions/seen.json`, back to
+90 days before the first run), oldest first, 400 per run: commit messages, GitHub PRs, review
+comments, issues and issue comments written by the repo's owners, members and collaborators (via
+`gh api`), and the messages you typed in Claude Code sessions for this repo. Bots and short texts
+are skipped. A batch that keeps failing is retried on later runs, at most 3 times. A
 model (`claude -p`, or the Anthropic API with `claude-opus-5-5`) returns decision records, using the
 prompt measured in the study: 82% of extracted records were real, durable decisions. Existing
 decisions are passed in, so a text that changes one comes back as a proposal that supersedes it.

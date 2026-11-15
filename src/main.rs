@@ -8,6 +8,7 @@ mod extract;
 mod git;
 mod install;
 mod lang;
+mod manifest;
 mod message;
 mod pattern;
 mod record;

@@ -1,4 +1,4 @@
-//! Model backends used to write rules. `ingrain check` never calls these.
+//! Model backends for `extract` and `check --judge`. Hooks never call these.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -6,7 +6,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-/// Default model for rule writing.
+/// Default model for extraction and judging.
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
 
 pub trait Llm: Send + Sync {
@@ -83,7 +83,7 @@ impl Llm for AnthropicApi {
         let body = json!({
             "model": self.model,
             "max_tokens": 16000,
-            // Route refusals to a fallback model server-side instead of failing the rule.
+            // Route refusals to a fallback model server-side instead of failing the call.
             "fallbacks": "default",
             "messages": [{"role": "user", "content": prompt}],
         });
@@ -102,7 +102,7 @@ impl Llm for AnthropicApi {
             bail!("Anthropic API returned {status}: {}", value["error"]["message"]);
         }
         if value["stop_reason"] == "refusal" {
-            bail!("the model declined to write this rule");
+            bail!("the model declined the request");
         }
         Ok(value["content"]
             .as_array()

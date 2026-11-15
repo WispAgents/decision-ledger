@@ -82,6 +82,9 @@ pub struct Outcome {
     pub calls: usize,
     pub failed_calls: usize,
     pub duplicates: usize,
+    /// Ids of texts whose batch succeeded, and of texts whose batch failed.
+    pub processed: Vec<String>,
+    pub failed: Vec<String>,
 }
 
 /// Extract proposals from `texts`. `known` are live and pending records (for dedup and
@@ -123,11 +126,14 @@ pub fn extract(
         .filter(|r| r.is_live())
         .map(|r| r.id.as_str())
         .collect();
-    for r in results {
+    for (batch, r) in batches.iter().zip(results) {
+        let ids = batch.iter().map(|t| t.id.clone());
         let Ok(items) = r else {
             out.failed_calls += 1;
+            out.failed.extend(ids);
             continue;
         };
+        out.processed.extend(ids);
         for (text_id, e) in items {
             let Some(text) = texts.iter().find(|t| t.id == text_id) else {
                 continue;

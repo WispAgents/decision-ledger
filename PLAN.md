@@ -48,11 +48,17 @@ stale · hook <event>
 - [x] 4. CLI commands
 - [x] 5. Hooks + install (Claude Code settings, pre-commit), GitHub Action, CI
 - [x] 6. Tests: unit + end-to-end on a scripted repo; live check that Claude Code receives the context
-- [ ] 7. Independent review, fixes
-- [ ] 8. README, push
+- [x] 7. Independent review, fixes
+- [x] 8. README, push
 
 ## Log
 - 2026-11-15: Built the crate; 29 unit + 3 end-to-end tests (fake `claude` on PATH for extract).
 - Live check with Claude Code 2.1.322: SessionStart context made the agent consult the ledger and refuse;
   when pushed to write raw fetch, PreToolUse denied the Write and the agent reported the decision.
 - Study files moved to study/ (the study PLAN.md was accidentally overwritten, then restored from git).
+- Review (Claude subagent): 22 findings. Fixed 1-21: symlinked/new-file paths, outside-repo edits breaking Stop,
+  agents editing the ledger, CI judged by the base ledger, id-based extraction state, language-aware imports,
+  parsed manifests, safe accept order, lenient hooks, trimmed added lines, /compact reset, judge fail-soft,
+  session cwd filter, maintainer-only GitHub texts, escaping, unique proposal ids, atomic session writes.
+  Not fixed (documented): Stop doesn't see Bash edits (#22).
+- Live re-check after the rewrite: Write with raw fetch still denied by PreToolUse.

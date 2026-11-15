@@ -5,6 +5,7 @@
 
 use crate::diff::LineRange;
 use crate::lang;
+use crate::manifest;
 use crate::pattern::{CompiledRule, Parsed};
 use crate::record::Record;
 use crate::scope::Scope;
@@ -16,6 +17,8 @@ pub struct Target {
     pub content: String,
     /// Added lines (1-based). `None` means the whole file counts as added.
     pub added: Option<Vec<LineRange>>,
+    /// The file before the change (`None` for a new file). Used to compare manifests.
+    pub before: Option<String>,
 }
 
 impl Target {
@@ -62,7 +65,7 @@ impl<'a> Checker<'a> {
                     let yaml = format!(
                         "id: {}-{i}\nlanguage: {}\nrule:\n  pattern: {}\nmessage: x\n",
                         r.id,
-                        p.language,
+                        serde_json::to_string(&p.language).expect("string serializes"),
                         serde_json::to_string(&p.pattern).expect("string serializes")
                     );
                     CompiledRule::compile(&yaml)
@@ -81,29 +84,30 @@ impl<'a> Checker<'a> {
 
     pub fn check(&self, target: &Target) -> Vec<Violation> {
         let lines: Vec<&str> = target.content.lines().collect();
-        let manifest = is_manifest(&target.path);
         let language = lang::detect(&target.path);
         let parsed = language.map(|l| Parsed::new(l, &target.content));
+        let new_deps = added_deps(target);
         let mut out = Vec::new();
         for r in &self.records {
             // Dependency decisions are about the project, so they apply to every manifest.
-            if manifest {
-                for (i, line) in lines.iter().enumerate() {
-                    let n = i as u32 + 1;
-                    if !target.is_added(n) {
-                        continue;
-                    }
-                    for dep in &r.checks.forbid_deps {
-                        if declares_dep(&target.path, line, dep) {
-                            out.push(violation(
-                                r,
-                                target,
-                                &lines,
-                                n,
-                                format!("adds dependency `{dep}`"),
-                            ));
-                        }
-                    }
+            for dep in &new_deps {
+                if let Some(forbidden) = r
+                    .checks
+                    .forbid_deps
+                    .iter()
+                    .find(|f| manifest::same(&target.path, dep, f))
+                {
+                    let line = lines
+                        .iter()
+                        .position(|l| l.to_lowercase().contains(dep))
+                        .map_or(1, |i| i as u32 + 1);
+                    out.push(violation(
+                        r,
+                        target,
+                        &lines,
+                        line,
+                        format!("adds dependency `{forbidden}`"),
+                    ));
                 }
             }
             if Scope::of(r)
@@ -112,12 +116,15 @@ impl<'a> Checker<'a> {
             {
                 continue;
             }
-            for (i, line) in lines.iter().enumerate() {
-                let n = i as u32 + 1;
-                if !target.is_added(n) {
-                    continue;
-                }
-                if let Some(module) = imported_module(line) {
+            if let Some(syntax) = language.and_then(ImportSyntax::of) {
+                for (i, line) in lines.iter().enumerate() {
+                    let n = i as u32 + 1;
+                    if !target.is_added(n) {
+                        continue;
+                    }
+                    let Some(module) = syntax.module(line) else {
+                        continue;
+                    };
                     for forbidden in &r.checks.forbid_imports {
                         if module_matches(&module, forbidden) {
                             out.push(violation(r, target, &lines, n, format!("imports `{module}`")));
@@ -202,83 +209,128 @@ fn ignore_reason(lines: &[&str], line: u32, id: &str) -> Option<String> {
     None
 }
 
-/// The module a line imports, for JS/TS, Python, Go and Rust import syntax.
-fn imported_module(line: &str) -> Option<String> {
-    let t = line.trim();
-    let quoted = |s: &str| -> Option<String> {
-        let start = s.find(['\'', '"', '`'])?;
-        let q = s[start..].chars().next()?;
-        let rest = &s[start + 1..];
-        Some(rest[..rest.find(q)?].to_owned())
+/// Dependencies the change adds to a manifest (empty for other files or unparsable ones).
+fn added_deps(t: &Target) -> Vec<String> {
+    if !manifest::is_manifest(&t.path) {
+        return Vec::new();
+    }
+    let Some(after) = manifest::deps(&t.path, &t.content) else {
+        return Vec::new();
     };
-    if t.starts_with("import ") || t.starts_with("export ") {
-        if let Some(pos) = t.find(" from ") {
-            return quoted(&t[pos..]);
-        }
-        if t.starts_with("import ") && (t.contains('\'') || t.contains('"')) {
-            return quoted(t); // `import 'x'` (JS) or Go single-line `import "x"`
-        }
-        // Python `import a.b as c`, `import a, b`
-        let rest = t.strip_prefix("import ")?;
-        let first = rest.split([',', ' ']).next()?.trim();
-        return (!first.is_empty() && !first.starts_with('{') && !first.starts_with('*'))
-            .then(|| first.to_owned());
-    }
-    if let Some(rest) = t.strip_prefix("from ") {
-        return rest.split_whitespace().next().map(str::to_owned);
-    }
-    if let Some(pos) = t.find("require(").or_else(|| t.find("import(")) {
-        return quoted(&t[pos..]);
-    }
-    if let Some(rest) = t.strip_prefix("use ").or_else(|| t.strip_prefix("pub use ")) {
-        return Some(
-            rest.trim_end_matches(';')
-                .split(['{', ' '])
-                .next()?
-                .trim_end_matches("::")
-                .to_owned(),
-        );
-    }
-    // A line inside a Go import block: `"net/http"` or `alias "net/http"`.
-    if t.ends_with('"') && t.matches('"').count() == 2 && !t.contains(['=', '(', ':']) {
-        return quoted(t);
-    }
-    None
+    let before = t
+        .before
+        .as_deref()
+        .and_then(|b| manifest::deps(&t.path, b))
+        .unwrap_or_default();
+    after.difference(&before).cloned().collect()
 }
 
+/// Import syntax by language family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportSyntax {
+    JavaScript,
+    Python,
+    Go,
+    Rust,
+}
+
+impl ImportSyntax {
+    fn of(lang: lang::Lang) -> Option<Self> {
+        use ast_grep_language::SupportLang as L;
+        match lang {
+            L::TypeScript | L::Tsx | L::JavaScript => Some(Self::JavaScript),
+            L::Python => Some(Self::Python),
+            L::Go => Some(Self::Go),
+            L::Rust => Some(Self::Rust),
+            _ => None,
+        }
+    }
+
+    /// The module an (added) line imports.
+    fn module(self, line: &str) -> Option<String> {
+        let t = line.trim();
+        match self {
+            Self::JavaScript => {
+                // `import x from 'm'`, `export * from 'm'`, `} from 'm'` (multi-line), `import 'm'`,
+                // `require('m')`, `import('m')`.
+                let statement = ["import", "export", "}", "from "]
+                    .iter()
+                    .any(|p| t.starts_with(p));
+                if statement
+                    && let Some(pos) = t.find(" from ").or_else(|| t.starts_with("from ").then_some(0))
+                {
+                    return quoted(&t[pos..]);
+                }
+                if t.starts_with("import '") || t.starts_with("import \"") {
+                    return quoted(t);
+                }
+                let pos = t.find("require(").or_else(|| t.find("import("))?;
+                quoted(&t[pos..])
+            }
+            Self::Python => {
+                if let Some(rest) = t.strip_prefix("from ") {
+                    return rest.split_whitespace().next().map(str::to_owned);
+                }
+                let rest = t.strip_prefix("import ")?;
+                rest.split([',', ' '])
+                    .next()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                    .map(str::to_owned)
+            }
+            Self::Go => {
+                // `import "m"`, `import alias "m"`, or a line inside an import block.
+                let body = t.strip_prefix("import ").unwrap_or(t);
+                let words: Vec<&str> = body.split_whitespace().collect();
+                let looks_like_spec =
+                    matches!(words.len(), 1 | 2) && body.ends_with('"') && body.matches('"').count() == 2;
+                looks_like_spec.then(|| quoted(body)).flatten()
+            }
+            Self::Rust => {
+                let rest = t.strip_prefix("use ").or_else(|| t.strip_prefix("pub use "))?;
+                // A real `use` item ends the path with `;` or opens a `{` group.
+                if !(rest.ends_with(';') || rest.contains('{')) {
+                    return None;
+                }
+                let path = rest
+                    .trim_end_matches(';')
+                    .split(['{', ' '])
+                    .next()?
+                    .trim_end_matches("::");
+                path.chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                    .then(|| path.to_owned())
+            }
+        }
+    }
+}
+
+fn quoted(s: &str) -> Option<String> {
+    let start = s.find(['\'', '"', '`'])?;
+    let q = s[start..].chars().next()?;
+    let rest = &s[start + 1..];
+    Some(rest[..rest.find(q)?].to_owned())
+}
+
+/// `requests` forbids `requests` and `requests.adapters`; `api/` forbids `../api/client`
+/// but not `../rapi/client`. Matching is on whole segments.
 fn module_matches(module: &str, forbidden: &str) -> bool {
-    module == forbidden
-        || [".", "/", "::"].iter().any(|sep| module.starts_with(&format!("{forbidden}{sep}")))
-        // Relative paths: forbidding `api/` should catch `../api/client`.
-        || (forbidden.contains('/') && module.contains(forbidden.trim_start_matches("./")))
-}
-
-fn is_manifest(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    matches!(
-        name,
-        "package.json" | "pyproject.toml" | "Cargo.toml" | "go.mod" | "Pipfile" | "setup.py" | "setup.cfg"
-    ) || (name.starts_with("requirements") && name.ends_with(".txt"))
-}
-
-/// Whether an (added) manifest line declares `dep`.
-fn declares_dep(path: &str, line: &str, dep: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let t = line.trim().trim_start_matches(['"', '\'']);
-    let dep_lower = dep.to_lowercase();
-    let lower = t.to_lowercase();
-    let starts_with_name = |s: &str| {
-        s.starts_with(&dep_lower)
-            && s[dep_lower.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/'))
-    };
-    match name {
-        "package.json" => line.contains(&format!("\"{dep}\"")) && line.contains(':'),
-        "go.mod" => lower.trim_start_matches("require ").starts_with(&dep_lower),
-        _ => starts_with_name(&lower),
+    let forbidden = forbidden.trim();
+    if module == forbidden
+        || [".", "/", "::"]
+            .iter()
+            .any(|sep| module.starts_with(&format!("{forbidden}{sep}")))
+    {
+        return true;
     }
+    let want: Vec<&str> = forbidden
+        .trim_matches('/')
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let have: Vec<&str> = module.split('/').collect();
+    forbidden.contains('/') && !want.is_empty() && have.windows(want.len()).any(|w| w == want.as_slice())
 }
 
 #[cfg(test)]
@@ -302,37 +354,49 @@ mod tests {
             path: path.into(),
             content: content.into(),
             added,
+            before: None,
         }
     }
 
     #[test]
-    fn imports() {
+    fn imports_by_language() {
+        use ast_grep_language::SupportLang as L;
+        let js = ImportSyntax::of(L::TypeScript).unwrap();
+        assert_eq!(js.module("import axios from 'axios';").as_deref(), Some("axios"));
+        assert_eq!(js.module("} from \"axios\";").as_deref(), Some("axios"));
         assert_eq!(
-            imported_module("import axios from 'axios';").as_deref(),
-            Some("axios")
-        );
-        assert_eq!(
-            imported_module("import { a } from \"../api/client\"").as_deref(),
-            Some("../api/client")
-        );
-        assert_eq!(
-            imported_module("const x = require('node-fetch')").as_deref(),
+            js.module("const x = require('node-fetch')").as_deref(),
             Some("node-fetch")
         );
         assert_eq!(
-            imported_module("from requests.adapters import X").as_deref(),
+            js.module("  \"axios\",").as_deref(),
+            None,
+            "a string in a list is not an import"
+        );
+        let py = ImportSyntax::of(L::Python).unwrap();
+        assert_eq!(
+            py.module("from requests.adapters import X").as_deref(),
             Some("requests.adapters")
         );
-        assert_eq!(imported_module("import os, sys").as_deref(), Some("os"));
+        assert_eq!(py.module("import os, sys").as_deref(), Some("os"));
+        let go = ImportSyntax::of(L::Go).unwrap();
+        assert_eq!(go.module("\t\"net/http\"").as_deref(), Some("net/http"));
         assert_eq!(
-            imported_module("use reqwest::Client;").as_deref(),
+            go.module("\tpb \"example.com/proto\"").as_deref(),
+            Some("example.com/proto")
+        );
+        let rs = ImportSyntax::of(L::Rust).unwrap();
+        assert_eq!(
+            rs.module("use reqwest::Client;").as_deref(),
             Some("reqwest::Client")
         );
-        assert_eq!(imported_module("\t\"net/http\"").as_deref(), Some("net/http"));
-        assert_eq!(imported_module("let x = 1;"), None);
+        assert_eq!(rs.module("use axios only in legacy code"), None);
+        assert!(ImportSyntax::of(L::Json).is_none());
         assert!(module_matches("requests.adapters", "requests"));
         assert!(!module_matches("requests_toolbelt", "requests"));
         assert!(module_matches("../api/client", "api/"));
+        assert!(!module_matches("../rapi/client", "api/"));
+        assert!(!module_matches("@aws-sdk/client-s3-extra", "@aws-sdk/client-s3"));
     }
 
     #[test]
@@ -368,11 +432,21 @@ mod tests {
             &["src/**"],
         )];
         let checker = Checker::new(&records);
-        let pkg = "{\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  }\n}\n";
-        assert_eq!(checker.check(&target("package.json", pkg, None)).len(), 1);
+        let pkg = "{\n  \"name\": \"redis\",\n  \"dependencies\": {\n    \"axios\": \"^1.0.0\"\n  }\n}\n";
+        assert_eq!(
+            checker.check(&target("package.json", pkg, None)).len(),
+            1,
+            "the package name isn't a dependency"
+        );
+        let mut had = target("package.json", pkg, None);
+        had.before = Some(pkg.into());
+        assert!(
+            checker.check(&had).is_empty(),
+            "already a dependency before the change"
+        );
         let req = "redis==5.0\nredis-om==1\n";
         assert_eq!(checker.check(&target("requirements.txt", req, None)).len(), 1);
-        let py = "dependencies = [\n  \"redis>=5\",\n]\n";
+        let py = "[project]\ndependencies = [\"redis>=5\"]\n";
         assert_eq!(checker.check(&target("pyproject.toml", py, None)).len(), 1);
     }
 

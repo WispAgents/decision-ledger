@@ -7,33 +7,43 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 /// Accept a proposal: give it the next `D-` id, make it live, and retire what it supersedes.
+/// The new record is written before the old one is retired, so a failure halfway never
+/// leaves the ledger without the decision.
 pub fn accept(repo: &Repo, pending_id: &str) -> Result<String> {
     let mut record = repo.ledger.get_pending(pending_id)?;
     let pending_path = repo.ledger.pending_path(pending_id)?;
-    let id = repo.ledger.next_id()?;
-    let mut staged = Vec::new();
-    if let Some(old_id) = record.supersedes.clone() {
-        let mut old = repo
-            .ledger
-            .get(&old_id)
-            .with_context(|| format!("{pending_id} supersedes {old_id}, which doesn't exist"))?;
-        if !old.is_live() {
-            bail!(
-                "{pending_id} supersedes {old_id}, which is already superseded by {}",
-                old.superseded_by.as_deref().unwrap_or("?")
-            );
+    let old = match record.supersedes.clone() {
+        Some(old_id) => {
+            let old = repo
+                .ledger
+                .get(&old_id)
+                .with_context(|| format!("{pending_id} supersedes {old_id}, which doesn't exist"))?;
+            if !old.is_live() {
+                bail!(
+                    "{pending_id} supersedes {old_id}, which is already superseded by {}",
+                    old.superseded_by.as_deref().unwrap_or("?")
+                );
+            }
+            Some(old)
         }
-        old.status = Status::Superseded;
-        old.superseded_by = Some(id.clone());
-        let path = repo.ledger.path(&old_id)?;
-        old.save(&path)?;
-        staged.push(path);
-    }
+        None => None,
+    };
+    let id = repo.ledger.next_id()?;
     record.id = id.clone();
     record.status = Status::Accepted;
     let path = repo.ledger.path(&id)?;
     record.save(&path)?;
-    staged.push(path);
+    let mut staged = vec![path.clone()];
+    if let Some(mut old) = old {
+        let old_path = repo.ledger.path(&old.id)?;
+        old.status = Status::Superseded;
+        old.superseded_by = Some(id.clone());
+        if let Err(e) = old.save(&old_path) {
+            let _ = std::fs::remove_file(&path);
+            return Err(e.context(format!("couldn't retire {}; {id} was not added", old.id)));
+        }
+        staged.push(old_path);
+    }
     std::fs::remove_file(&pending_path)?;
     for p in staged {
         let rel = repo.git.relative(&p);
@@ -123,8 +133,17 @@ pub fn interactive(dir: &Path) -> Outcome {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Text from GitHub or a model, safe to print: no control characters or escape sequences.
+fn clean(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() || *c == '\n').collect()
+}
+
 /// The review card for one proposal.
 pub fn card(repo: &Repo, r: &Record) -> String {
+    clean(&card_text(repo, r))
+}
+
+fn card_text(repo: &Repo, r: &Record) -> String {
     let mut s = format!("{}  ({:?})\n  {}\n", r.id, r.category, r.decision);
     if !r.reason.is_empty() {
         s.push_str(&format!("  why: {}\n", r.reason));

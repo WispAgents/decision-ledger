@@ -1,5 +1,5 @@
 use super::Outcome;
-use crate::record::{Record, Status, proposal_id, today};
+use crate::record::{Record, Status, today};
 use crate::repo::Repo;
 use anyhow::bail;
 use std::path::Path;
@@ -36,7 +36,9 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
         bail!("a reason is required: why should {} change?", old.id);
     }
     let record = Record {
-        id: proposal_id(&format!("{}\0{}", old.id, args.decision)),
+        id: repo
+            .ledger
+            .fresh_pending_id(&format!("{}\0{}", old.id, args.decision))?,
         decision: args.decision.trim().to_owned(),
         reason: args.reason.trim().to_owned(),
         rejected: vec![old.decision.clone()],

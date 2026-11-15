@@ -175,6 +175,66 @@ impl Ledger {
         Ok(self.records()?.into_iter().filter(Record::is_live).collect())
     }
 
+    /// Live records, skipping (and reporting) files that don't parse, so one broken file
+    /// (say, with merge-conflict markers) doesn't switch off every hook.
+    pub fn live_lenient(&self) -> Vec<Record> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Record> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_record_file(p))
+            .filter_map(|p| {
+                Record::load(&p)
+                    .map_err(|e| eprintln!("decisions: skipping {}: {e:#}", p.display()))
+                    .ok()
+            })
+            .filter(Record::is_live)
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    /// Live records as committed at `rev`, so a change can't retire a decision and break it
+    /// in the same diff.
+    pub fn live_at(&self, git: &crate::git::Git, rev: &str) -> Result<Vec<Record>> {
+        let listing = git
+            .try_run(&[
+                "ls-tree",
+                "--name-only",
+                "--end-of-options",
+                rev,
+                &format!("{}/", Self::DIR),
+            ])
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for path in listing.lines().filter(|p| is_record_file(Path::new(p))) {
+            let text = git
+                .show(rev, path)
+                .with_context(|| format!("reading {path} at {rev}"))?;
+            let r: Record =
+                serde_yaml::from_str(&text).with_context(|| format!("invalid record {path} at {rev}"))?;
+            if r.is_live() {
+                out.push(r);
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    /// A proposal id that isn't taken yet.
+    pub fn fresh_pending_id(&self, seed: &str) -> Result<String> {
+        let base = proposal_id(seed);
+        let mut id = base.clone();
+        let mut n = 2;
+        while self.pending_path(&id)?.exists() {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        Ok(id)
+    }
+
     pub fn pending(&self) -> Result<Vec<Record>> {
         load_dir(&self.pending_dir())
     }
@@ -238,15 +298,17 @@ fn load_dir(dir: &Path) -> Result<Vec<Record>> {
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let is_record = path.is_file()
-            && path.extension().is_some_and(|e| e == "yml" || e == "yaml")
-            && path.file_name().is_some_and(|n| n != "rejected.yml");
-        if is_record {
+        if path.is_file() && is_record_file(&path) {
             out.push(Record::load(&path)?);
         }
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
+}
+
+fn is_record_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e == "yml" || e == "yaml")
+        && path.file_name().is_some_and(|n| n != "rejected.yml")
 }
 
 /// `P-xxxxxxxx`: a stable id for a proposal, from what it says and where it came from.

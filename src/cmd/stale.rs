@@ -33,8 +33,8 @@ pub fn run(dir: &Path) -> Outcome {
             // Path match only (fast); symbols fall back to `git grep`.
             let by_path = files.iter().any(|f| scope.matches(f, None).is_some());
             let by_symbol = !by_path
-                && r.scope
-                    .iter()
+                && scope
+                    .symbols()
                     .any(|s| repo.git.try_run(&["grep", "-q", "-w", "-F", "-e", s]).is_some());
             if !by_path && !by_symbol {
                 println!(

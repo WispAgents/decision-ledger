@@ -115,9 +115,11 @@ fn time_of(v: &Value, key: &str) -> i64 {
 }
 
 /// PRs, review comments, issues and issue comments created after `since`, newest first,
-/// up to `max_pages` pages of 100 per stream.
-pub fn github(repo: &str, since: i64, max_pages: u32) -> Result<Vec<Text>> {
+/// up to `max_pages` pages of 100 per stream. The flag is true when a stream hit the page
+/// limit before reaching `since`.
+pub fn github(repo: &str, since: i64, max_pages: u32) -> Result<(Vec<Text>, bool)> {
     let mut out = Vec::new();
+    let mut truncated = false;
     let streams = [
         (
             "pr",
@@ -148,6 +150,11 @@ pub fn github(repo: &str, since: i64, max_pages: u32) -> Result<Vec<Text>> {
                 if kind == "issue" && v.get("pull_request").is_some() {
                     continue;
                 }
+                // Only people with a role in the repo state its decisions; anyone can open an issue.
+                let role = v["author_association"].as_str().unwrap_or("");
+                if !matches!(role, "OWNER" | "MEMBER" | "COLLABORATOR") {
+                    continue;
+                }
                 let text = match kind {
                     "pr" | "issue" => format!(
                         "{}\n\n{}",
@@ -175,9 +182,12 @@ pub fn github(repo: &str, since: i64, max_pages: u32) -> Result<Vec<Text>> {
             if !full {
                 break;
             }
+            if page == max_pages {
+                truncated = true;
+            }
         }
     }
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// What the human typed in Claude Code sessions for this repository, after `since`.

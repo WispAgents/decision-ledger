@@ -51,13 +51,26 @@ pub struct Override {
 
 pub fn run(dir: &Path, args: Args) -> Outcome {
     let repo = Repo::open(dir)?;
-    let records = repo.live()?;
     let base = if args.staged {
         DiffBase::Staged
     } else if let Some(r) = &args.diff {
+        if r.starts_with('-') {
+            anyhow::bail!("`--diff` takes a revision range, not an option: {r}");
+        }
         DiffBase::Range(r.clone())
     } else {
         DiffBase::Head
+    };
+    // Pre-commit and CI judge a change by the decisions it started from, so the same change
+    // can't retire a decision and break it. Locally (working tree) the current ledger counts.
+    let records = match (&base, base.before_rev(&repo.git)) {
+        (DiffBase::Head, _) | (_, None) => repo.live()?,
+        (_, Some(rev)) => repo.ledger.live_at(&repo.git, &rev)?,
+    };
+    let ledger_changes = if base == DiffBase::Head {
+        Vec::new()
+    } else {
+        repo.ledger_changes(&base)
     };
     let only: Vec<String> = args
         .paths
@@ -88,6 +101,15 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
             );
         }
         Format::Github => {
+            for f in &ledger_changes {
+                println!(
+                    "::notice file={},title=decision ledger changed::{}",
+                    prop(f),
+                    esc(
+                        "This PR changes the decision ledger; it was checked against the base revision's decisions."
+                    )
+                );
+            }
             for v in &active {
                 let text = records
                     .iter()
@@ -126,6 +148,9 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
             }
             for j in &judged {
                 println!("{}:{}  possibly against {}: {}", j.path, j.line, j.id, j.why);
+            }
+            for f in &ledger_changes {
+                println!("note: this change edits {f}; it was checked against the decisions it started from");
             }
             if found.is_empty() && judged.is_empty() {
                 println!(

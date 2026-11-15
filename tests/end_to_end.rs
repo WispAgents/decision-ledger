@@ -272,14 +272,24 @@ fn extract_proposes_and_review_remembers_rejections() {
         .to_string_lossy()
         .into_owned();
 
-    // The cursor moved: a second run reads nothing new.
-    assert!(
+    let extract = |dir: &Path| {
         ok(
             dir,
-            &["extract", "--llm", "claude", "--no-github", "--no-sessions"]
+            &[
+                "extract",
+                "--llm",
+                "claude",
+                "--no-github",
+                "--no-sessions",
+                "--since",
+                "2000-01-01",
+            ],
         )
-        .contains("0 texts worth reading")
-    );
+    };
+
+    // Texts already read aren't read again.
+    let again = extract(dir);
+    assert!(again.contains("0 new texts worth reading"), "{again}");
 
     // Reject needs a reason, and the decision isn't proposed again.
     assert!(!run(dir, &["reject", &id, "--reason", " "], "").status.success());
@@ -287,18 +297,16 @@ fn extract_proposes_and_review_remembers_rejections() {
         dir,
         &["reject", &id, "--reason", "we're dropping the design system"],
     );
-    let out = ok(
+    std::fs::write(dir.join("src/ui.ts"), "export const ui = 3;\n").unwrap();
+    git(
         dir,
         &[
-            "extract",
-            "--llm",
-            "claude",
-            "--no-github",
-            "--no-sessions",
-            "--since",
-            "2000-01-01",
+            "commit",
+            "-qam",
+            "ui: more buttons from the design system\n\nAgain: all buttons come from @acme/ds, never hand-rolled button elements.",
         ],
     );
+    let out = extract(dir);
     assert!(
         out.contains("0 proposals") && out.contains("1 duplicates"),
         "{out}"
@@ -315,4 +323,74 @@ fn hooks_fail_open_outside_a_repo() {
     );
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn review_regressions_symlinks_outside_edits_and_ledger_tampering() {
+    let tmp = repo();
+    let dir = tmp.path();
+    ok(dir, &["init", "--no-git-hook"]);
+    ok(
+        dir,
+        &[
+            "add",
+            "No axios in src.",
+            "--scope",
+            "src/**",
+            "--forbid-import",
+            "axios",
+        ],
+    );
+    git(dir, &["commit", "-qm", "decisions"]);
+
+    // The temp dir is behind a symlink on macOS (/var → /private/var); a new file in a new
+    // directory must still be checked.
+    let new_file = dir.join("src/newdir/c.ts");
+    let write = json!({"session_id": "s", "cwd": dir, "tool_name": "Write",
+        "tool_input": {"file_path": new_file, "content": "import axios from 'axios';\n"}});
+    assert_eq!(
+        hook(dir, "pre-tool-use", write).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+
+    // An edit outside the repo doesn't switch off the Stop hook.
+    let outside = json!({"session_id": "s2", "cwd": dir, "tool_name": "Write",
+        "tool_input": {"file_path": "/tmp/somewhere-else/plan.md", "content": "notes"}});
+    assert!(hook(dir, "pre-tool-use", outside).is_none());
+    let inside = json!({"session_id": "s2", "cwd": dir, "tool_name": "Write",
+        "tool_input": {"file_path": dir.join("src/d.ts"), "content": "export const d = 1;\n"}});
+    hook(dir, "pre-tool-use", inside);
+    std::fs::write(dir.join("src/d.ts"), "import axios from 'axios';\n").unwrap();
+    assert_eq!(
+        hook(dir, "stop", json!({"session_id": "s2", "cwd": dir})).unwrap()["decision"],
+        "block"
+    );
+
+    // Agents can't edit accepted records.
+    let tamper = json!({"session_id": "s", "cwd": dir, "tool_name": "Edit",
+        "tool_input": {"file_path": dir.join("decisions/D-0001.yml"), "old_string": "status: accepted", "new_string": "status: superseded"}});
+    assert_eq!(
+        hook(dir, "pre-tool-use", tamper).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+
+    // CI: a branch that retires the decision and breaks it in the same diff still fails,
+    // because it's judged by the base revision's ledger.
+    std::fs::remove_file(dir.join("src/d.ts")).unwrap();
+    git(dir, &["checkout", "-q", "-b", "sneaky"]);
+    let record = std::fs::read_to_string(dir.join("decisions/D-0001.yml"))
+        .unwrap()
+        .replace("status: accepted", "status: superseded");
+    std::fs::write(dir.join("decisions/D-0001.yml"), record).unwrap();
+    std::fs::write(dir.join("src/e.ts"), "import axios from 'axios';\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-qm", "retire and break"]);
+    let out = run(dir, &["check", "--diff", "main...HEAD"], "");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("note: this change edits decisions/D-0001.yml"));
 }

@@ -36,6 +36,14 @@ impl Scope {
         Self { entries }
     }
 
+    /// Symbol entries, as matched in code (`Query.commands` → `commands`).
+    pub fn symbols(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|e| match e {
+            Entry::Symbol(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn is_repo_wide(&self) -> bool {
         self.entries.iter().any(|e| matches!(e, Entry::Everywhere))
     }

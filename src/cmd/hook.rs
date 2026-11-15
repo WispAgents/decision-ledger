@@ -9,7 +9,7 @@ use crate::record::Record;
 use crate::repo::Repo;
 use crate::scope::{self, Scope};
 use crate::session::Session;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Read;
@@ -44,16 +44,29 @@ pub fn run(dir: &Path, event: Event) -> Outcome {
 pub fn handle(dir: &Path, event: Event, payload: &Value) -> Result<Option<Value>> {
     let dir = payload["cwd"].as_str().map(Path::new).unwrap_or(dir);
     let repo = Repo::open(dir)?;
-    let records = repo.live()?;
-    if records.is_empty() {
-        return Ok(None);
-    }
     let session_id = payload["session_id"].as_str().unwrap_or("default");
     let state = repo.state_dir();
     let mut session = Session::load(&state, session_id);
+
+    // The ledger itself is reviewed by humans; agents propose through `decisions add --propose`.
+    if let Event::PreToolUse = event
+        && let Some(rel) = edited_path(&repo, payload)
+        && is_ledger_record(&rel)
+    {
+        return Ok(Some(deny(format!(
+            "`{rel}` is an accepted decision record; agents don't edit it. To change a decision, run \
+             `decisions supersede <id> --decision \"...\" --reason \"...\"`; to record a new one, \
+             `decisions add --propose \"...\"`. A human reviews both."
+        ))));
+    }
+
+    let records = repo.ledger.live_lenient();
+    if records.is_empty() {
+        return Ok(None);
+    }
     let answer = match event {
-        Event::SessionStart => session_start(&records, &mut session),
-        Event::PreToolUse => pre_tool_use(&repo, &records, &mut session, payload)?,
+        Event::SessionStart => session_start(&records, &mut session, payload),
+        Event::PreToolUse => pre_tool_use(&repo, &records, &mut session, payload),
         Event::Stop => stop(&repo, &records, &mut session)?,
     };
     session.save(&state, session_id)?;
@@ -64,7 +77,27 @@ fn context(event: &str, text: String) -> Value {
     json!({ "hookSpecificOutput": { "hookEventName": event, "additionalContext": text } })
 }
 
-fn session_start(records: &[Record], session: &mut Session) -> Option<Value> {
+fn deny(reason: String) -> Value {
+    json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
+}
+
+/// The repo-relative path an edit targets; `None` for files outside the repository.
+fn edited_path(repo: &Repo, payload: &Value) -> Option<String> {
+    let file = payload["tool_input"]["file_path"].as_str()?;
+    repo.git.relative_in_repo(Path::new(file))
+}
+
+/// `decisions/*.yml`, but not proposals or the gitignore.
+fn is_ledger_record(rel: &str) -> bool {
+    rel.strip_prefix("decisions/")
+        .is_some_and(|rest| !rest.contains('/') && (rest.ends_with(".yml") || rest.ends_with(".yaml")))
+}
+
+fn session_start(records: &[Record], session: &mut Session, payload: &Value) -> Option<Value> {
+    // After /compact or /clear the model no longer has what it was shown.
+    if matches!(payload["source"].as_str(), Some("compact" | "clear")) {
+        session.shown.clear();
+    }
     let wide: Vec<&Record> = records.iter().filter(|r| Scope::of(r).is_repo_wide()).collect();
     let scoped = records.len() - wide.len();
     let shown: Vec<&Record> = wide.iter().take(SHOW_MAX).copied().collect();
@@ -75,67 +108,51 @@ fn session_start(records: &[Record], session: &mut Session) -> Option<Value> {
     ))
 }
 
-fn pre_tool_use(
-    repo: &Repo,
-    records: &[Record],
-    session: &mut Session,
-    payload: &Value,
-) -> Result<Option<Value>> {
-    let input = &payload["tool_input"];
-    let file = input["file_path"]
-        .as_str()
-        .context("hook input has no tool_input.file_path")?;
-    let rel = repo.git.relative(Path::new(file));
-    if rel.starts_with("decisions/") {
-        return Ok(None);
-    }
+fn pre_tool_use(repo: &Repo, records: &[Record], session: &mut Session, payload: &Value) -> Option<Value> {
+    let rel = edited_path(repo, payload)?;
     session.edited.insert(rel.clone());
     let current = repo.read(&rel);
+    let after = apply_edit(
+        payload["tool_name"].as_str().unwrap_or(""),
+        &payload["tool_input"],
+        current.as_deref(),
+    );
 
     // Check what the file would look like after this edit, before it happens.
-    if let Some(after) = apply_edit(
-        payload["tool_name"].as_str().unwrap_or(""),
-        input,
-        current.as_deref(),
-    ) {
-        let added = added_lines(current.as_deref().unwrap_or(""), &after);
+    if let Some(after) = &after {
+        let added = added_lines(current.as_deref().unwrap_or(""), after);
         let checker = Checker::new(records);
         if !checker.is_empty() && !added.is_empty() {
             let target = Target {
                 path: rel.clone(),
-                content: after,
+                content: after.clone(),
                 added: Some(added),
+                before: current.clone(),
             };
             let found = checker.check(&target);
-            super::check::log_overrides(repo, &found)?;
             let active: Vec<&Violation> = found.iter().filter(|v| v.overridden.is_none()).collect();
             if !active.is_empty() {
-                return Ok(Some(json!({
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": message::violations(&active, records, true),
-                    }
-                })));
+                return Some(deny(message::violations(&active, records, true)));
             }
         }
     }
 
     // Otherwise, show the decisions for this file that the agent hasn't seen yet.
-    let new: Vec<&Record> = scope::applicable(records, &rel, current.as_deref())
+    let content = after.as_deref().or(current.as_deref());
+    let new: Vec<&Record> = scope::applicable(records, &rel, content)
         .into_iter()
         .map(|(r, _)| r)
         .filter(|r| !session.shown.contains(&r.id))
         .collect();
     if new.is_empty() {
-        return Ok(None);
+        return None;
     }
     let shown: Vec<&Record> = new.iter().take(SHOW_MAX).copied().collect();
     session.shown.extend(shown.iter().map(|r| r.id.clone()));
-    Ok(Some(context(
+    Some(context(
         "PreToolUse",
         message::scoped(&rel, &shown, new.len() - shown.len()),
-    )))
+    ))
 }
 
 fn stop(repo: &Repo, records: &[Record], session: &mut Session) -> Result<Option<Value>> {
@@ -146,6 +163,9 @@ fn stop(repo: &Repo, records: &[Record], session: &mut Session) -> Result<Option
     let targets = repo.targets(&DiffBase::Head, Some(&edited))?;
     let checker = Checker::new(records);
     let found: Vec<Violation> = targets.iter().flat_map(|t| checker.check(t)).collect();
+    if let Err(e) = super::check::log_overrides(repo, &found) {
+        eprintln!("decisions: couldn't log overrides: {e:#}");
+    }
     let active: Vec<&Violation> = found.iter().filter(|v| v.overridden.is_none()).collect();
     if active.is_empty() || session.stop_attempts >= STOP_MAX_ATTEMPTS {
         session.stop_attempts = 0;
@@ -191,13 +211,14 @@ fn apply_edit(tool: &str, input: &Value, current: Option<&str>) -> Option<String
 /// Lines of `after` that aren't in `before` (as a multiset), as ranges.
 fn added_lines(before: &str, after: &str) -> Vec<LineRange> {
     let mut have: HashMap<&str, usize> = HashMap::new();
+    // Trimmed, so re-indenting existing code doesn't count as adding it.
     for l in before.lines() {
-        *have.entry(l.trim_end()).or_default() += 1;
+        *have.entry(l.trim()).or_default() += 1;
     }
     let mut out: Vec<LineRange> = Vec::new();
     for (i, l) in after.lines().enumerate() {
         let n = i as u32 + 1;
-        let left = have.entry(l.trim_end()).or_default();
+        let left = have.entry(l.trim()).or_default();
         if *left > 0 {
             *left -= 1;
             continue;
@@ -232,5 +253,10 @@ mod tests {
             vec![LineRange::new(2, 3), LineRange::new(6, 6)]
         );
         assert!(added_lines("a\nb", "b\na").is_empty());
+        assert!(
+            added_lines("import x", "if (y) {\n  import x\n}")
+                .iter()
+                .all(|r| r.start != 2 || r.end != 2)
+        );
     }
 }

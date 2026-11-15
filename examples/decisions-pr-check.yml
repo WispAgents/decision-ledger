@@ -1,0 +1,11 @@
+# Copy to .github/workflows/decisions.yml in a repository with a decisions/ ledger.
+name: decisions
+on: pull_request
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the base commit must be available for the diff
+      - uses: WispAgents/decision-ledger/action@main

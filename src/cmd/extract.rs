@@ -118,7 +118,8 @@ pub fn run(dir: &Path, args: Args) -> Outcome {
 
     texts.retain(|t| source::worth_reading(t) && !seen.done.contains(&t.id));
     // Oldest first: a run that reads only part of the backlog continues where it stopped.
-    texts.sort_by_key(|t| t.time);
+    // Rule docs first: they state the most decisions per text.
+    texts.sort_by_key(|t| (t.kind != "doc", t.time));
     let backlog = texts.len();
     texts.truncate(args.max_texts);
     println!(
